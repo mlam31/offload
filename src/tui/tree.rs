@@ -90,20 +90,19 @@ pub struct Tree {
 impl Tree {
     pub fn new() -> Tree {
         let mut roots = Vec::new();
-        if let Ok(entries) = fs::read_dir("/Volumes") {
-            let mut vols: Vec<Node> = entries
-                .flatten()
-                .map(|e| e.path())
-                .map(|p| Node::new(p, true))
-                .collect();
-            vols.sort_by(|a, b| a.name.cmp(&b.name));
-            roots = vols;
+        for base in base_paths() {
+            if let Ok(entries) = fs::read_dir(&base) {
+                let mut vols: Vec<Node> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .map(|p| Node::new(p, true))
+                    .collect();
+                vols.sort_by(|a, b| a.name.cmp(&b.name));
+                roots.extend(vols);
+            }
         }
-        // The system disk is still browsable, just sorted last.
-        if let Some(pos) = roots
-            .iter()
-            .position(|n| n.name == "Macintosh HD")
-        {
+        // On macOS, the system disk is still browsable, just sorted last.
+        if let Some(pos) = roots.iter().position(|n| n.name == "Macintosh HD") {
             let sys = roots.remove(pos);
             roots.push(sys);
         }
@@ -209,4 +208,23 @@ fn find_mut<'a>(node: &'a mut Node, path: &PathBuf) -> Option<&'a mut Node> {
         }
     }
     None
+}
+
+/// Where the drive tree starts per platform.
+fn base_paths() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![PathBuf::from("/Volumes")]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        vec![PathBuf::from("/")]
+    }
+    #[cfg(windows)]
+    {
+        (b'C'..=b'Z')
+            .map(|c| PathBuf::from(format!("{}:\\", c as char)))
+            .filter(|p| p.exists())
+            .collect()
+    }
 }

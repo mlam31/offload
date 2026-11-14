@@ -49,6 +49,20 @@ offload --src ... --dest ... --force        # re-import known content
 State lives in `~/Library/Application Support/offload/`:
 `index.json` (imported-content hashes) and `config.json` (last destination).
 
+## Download
+
+Prebuilt binaries are on the [Releases](https://github.com/mlam31/offload/releases) page:
+
+| File | Platform |
+|---|---|
+| `offload-vX.Y.Z-aarch64-apple-darwin.tar.gz` | macOS — Apple Silicon (M1/M2/M3/M4) |
+| `offload-vX.Y.Z-x86_64-apple-darwin.tar.gz` | macOS — Intel |
+| `offload-vX.Y.Z-x86_64-pc-windows-gnu.zip` | Windows 64-bit |
+| `offload-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static, works on any distro) |
+
+Unpack, and run the `offload` binary inside (`offload.exe` on Windows).
+Each archive also contains this README.
+
 ## Build
 
 ```sh
@@ -56,6 +70,15 @@ cargo build --release
 # binary at target/release/offload — copy wherever you like, e.g.
 cp target/release/offload /usr/local/bin/
 ```
+
+## Platform notes
+
+- **macOS (best supported)**: SD-card auto-detection and the eject feature use
+  macOS-specific tools (`diskutil`, `lsof`).
+- **Windows / Linux**: everything else works the same — run headless with
+  `--src`/`--dest`, or browse the TUI tree from the filesystem root / drive
+  letters. Auto-detect looks for a volume layout only on macOS; elsewhere just
+  point `--src` at the card's mount or pick it in the tree.
 
 ## Supported formats
 
