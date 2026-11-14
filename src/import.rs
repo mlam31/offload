@@ -149,11 +149,17 @@ fn copy_one(source: &Path, dest: &PathBuf, expected_hash: &str) -> Result<Import
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    // Belt and braces: destination exists with identical content → skip.
+    // Airtight no-clobber guarantee: if anything now sits at the destination
+    // path, it is either identical content (skip) or a hard error — never an
+    // overwrite.
     if let Ok(md) = fs::metadata(dest) {
         if md.len() == sha_size(source)? && sha256_file(dest)? == expected_hash {
             return Ok(Imported::AlreadyThere);
         }
+        anyhow::bail!(
+            "destination already exists with different content, refusing to touch it: {}",
+            dest.display()
+        );
     }
 
     let copied = fs::copy(source, dest)
