@@ -83,3 +83,18 @@ fn mounted_volumes() -> Vec<PathBuf> {
 pub fn is_within(root: &Path, child: &Path) -> bool {
     child.starts_with(root)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_within_accepts_root_and_descendants_only() {
+        let root = Path::new("/Volumes/SSD");
+        assert!(is_within(root, Path::new("/Volumes/SSD")));
+        assert!(is_within(root, Path::new("/Volumes/SSD/sub/f.jpg")));
+        assert!(!is_within(root, Path::new("/Volumes/SSD2")));
+        assert!(!is_within(root, Path::new("/etc")));
+        assert!(!is_within(root, Path::new("/Volumes")));
+    }
+}

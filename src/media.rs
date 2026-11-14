@@ -42,3 +42,46 @@ pub fn is_apple_double(path: &Path) -> bool {
         .map(|n| n.to_string_lossy().starts_with("._"))
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn from_extension_is_case_insensitive() {
+        assert_eq!(MediaType::from_extension("jpg"), Some(MediaType::Jpeg));
+        assert_eq!(MediaType::from_extension("JPG"), Some(MediaType::Jpeg));
+        assert_eq!(MediaType::from_extension("Jpeg"), Some(MediaType::Jpeg));
+        assert_eq!(MediaType::from_extension("arw"), Some(MediaType::Arw));
+        assert_eq!(MediaType::from_extension("ARW"), Some(MediaType::Arw));
+        assert_eq!(MediaType::from_extension("mp4"), Some(MediaType::Clip));
+        assert_eq!(MediaType::from_extension("MOV"), Some(MediaType::Clip));
+        assert_eq!(MediaType::from_extension("txt"), None);
+        assert_eq!(MediaType::from_extension(""), None);
+    }
+
+    #[test]
+    fn labels_match_folder_structure() {
+        assert_eq!(MediaType::Jpeg.label(), "Photos/JPEG");
+        assert_eq!(MediaType::Arw.label(), "Photos/ARW");
+        assert_eq!(MediaType::Clip.label(), "Clips");
+    }
+
+    #[test]
+    fn is_hidden_detects_dot_components() {
+        assert!(is_hidden(Path::new("/Volumes/CARD/.Trashes/x.MP4")));
+        assert!(is_hidden(Path::new("/a/.Spotlight-V100")));
+        assert!(is_hidden(Path::new("._weird")));
+        assert!(!is_hidden(Path::new("/Volumes/CARD/DCIM/a.jpg")));
+        assert!(!is_hidden(Path::new("normal")));
+    }
+
+    #[test]
+    fn is_apple_double_detects_underscore_prefix() {
+        assert!(is_apple_double(Path::new("._DSC01234.ARW")));
+        assert!(is_apple_double(Path::new("/x/._y.jpg")));
+        assert!(!is_apple_double(Path::new("DSC01234.ARW")));
+        assert!(!is_apple_double(PathBuf::from("/x").as_path()));
+    }
+}

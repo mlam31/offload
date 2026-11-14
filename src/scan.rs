@@ -25,7 +25,10 @@ pub fn scan_source(root: &Path) -> Result<Vec<MediaFile>> {
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.path()))
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !is_hidden(e.path().strip_prefix(root).unwrap_or(e.path()))
+        })
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
@@ -95,4 +98,70 @@ fn modified_date(metadata: &std::fs::Metadata) -> Option<Date> {
     let modified = metadata.modified().ok()?;
     let ts = jiff::Timestamp::try_from(modified).ok()?;
     Some(ts.to_zoned(jiff::tz::TimeZone::system()).date())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Date::new returns a Result; tests always use valid dates.
+    fn d(y: i16, m: i8, day: i8) -> Date {
+        Date::new(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn parses_raw_exif_colon_format() {
+        assert_eq!(
+            parse_exif_datetime("2026:03:05 10:11:12"),
+            Some(d(2026, 3, 5))
+        );
+    }
+
+    #[test]
+    fn parses_display_dash_format() {
+        assert_eq!(
+            parse_exif_datetime("2026-03-05 10:11:12"),
+            Some(d(2026, 3, 5))
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_and_impossible_dates() {
+        assert_eq!(parse_exif_datetime(""), None);
+        assert_eq!(parse_exif_datetime("nonsense"), None);
+        assert_eq!(parse_exif_datetime("2026:13:40 00:00:00"), None);
+        assert_eq!(parse_exif_datetime("2026:02:30 00:00:00"), None);
+    }
+
+    #[test]
+    fn scan_skips_hidden_apple_double_and_non_media() {
+        let card = tempfile::TempDir::new().unwrap();
+        std::fs::write(card.path().join("DSC00001.ARW"), "raw").unwrap();
+        std::fs::write(card.path().join("DSC00002.JPG"), "jpg").unwrap();
+        std::fs::write(card.path().join("C0001.MP4"), "mp4").unwrap();
+        std::fs::write(card.path().join("._DSC00001.ARW"), "junk").unwrap();
+        std::fs::write(card.path().join("notes.txt"), "nope").unwrap();
+        let trashes = card.path().join(".Trashes");
+        std::fs::create_dir_all(&trashes).unwrap();
+        std::fs::write(trashes.join("x.MP4"), "junk").unwrap();
+
+        let files = scan_source(card.path()).unwrap();
+        let mut names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["C0001.MP4", "DSC00001.ARW", "DSC00002.JPG"]);
+
+        let arw = files.iter().find(|f| f.name == "DSC00001.ARW").unwrap();
+        assert_eq!(arw.media_type, MediaType::Arw);
+        assert_eq!(arw.size, 3);
+        // No EXIF in these stub files, so the mtime fallback must kick in.
+        for f in &files {
+            assert!(f.date.is_some(), "missing fallback date for {}", f.name);
+        }
+    }
+
+    #[test]
+    fn scan_of_empty_dir_is_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(scan_source(dir.path()).unwrap().is_empty());
+    }
 }

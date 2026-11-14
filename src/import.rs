@@ -1,13 +1,12 @@
 use std::fs;
 use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::config::{append_index, Index};
 use crate::dedup::sha256_file;
 use crate::plan::{Action, Plan, PlannedFile};
 
@@ -41,6 +40,13 @@ pub struct Skipped {
     pub known: Option<String>,
 }
 
+/// Largest run of failed copies we tolerate before concluding the
+/// destination stopped responding.
+const MAX_CONSECUTIVE_ERRORS: usize = 25;
+const DEST_UNRESPONSIVE: &str = "ABORTED: the destination stopped responding after repeated \
+     failures — is the SSD still connected? Files already copied \
+     are kept and indexed; re-run when the drive is back.";
+
 /// Execute a plan. Copy-only: there is no delete or move path anywhere.
 /// Files are streamed to the destination while their SHA-256 is computed in
 /// the same read pass, then size-verified. Every successful copy is appended
@@ -48,37 +54,21 @@ pub struct Skipped {
 /// produce duplicates when re-run.
 pub fn run(
     plan: &Plan,
-    _index: &Index,
+    index_path: &Path,
     dry_run: bool,
     cancel: &AtomicBool,
     tx: Sender<Progress>,
 ) -> Result<Summary> {
     let copies: Vec<&PlannedFile> = plan.files.iter().filter(|f| f.is_copy()).collect();
-    let total_bytes: u64 = copies.iter().map(|f| f.size).sum();
     let mut progress = Progress {
         total_files: copies.len(),
-        total_bytes,
+        total_bytes: copies.iter().map(|f| f.size).sum(),
         ..Default::default()
     };
-    let mut consecutive_errors = 0usize;
     let mut summary = Summary {
-        copied: 0,
-        copied_bytes: 0,
-        skipped: Vec::new(),
-        errors: Vec::new(),
-        cancelled: false,
+        skipped: collect_skips(plan),
+        ..Default::default()
     };
-
-    // Record skips (warnings) for everything that is not copied.
-    for f in &plan.files {
-        if let Action::SkipDuplicate { known } = &f.action {
-            summary.skipped.push(Skipped {
-                original_name: f.original_name.clone(),
-                size: f.size,
-                known: known.clone(),
-            });
-        }
-    }
 
     if dry_run {
         progress.finished = true;
@@ -86,79 +76,112 @@ pub fn run(
         return Ok(summary);
     }
 
-    for f in copies {
-        if cancel.load(Ordering::SeqCst) {
-            summary.cancelled = true;
-            break;
-        }
-        let Action::Copy { dest } = &f.action else { unreachable!() };
-
-        progress.current = f.original_name.clone();
-        let _ = tx.send(progress.clone());
-
-        match copy_one(&f.source, dest, f.hash.as_deref()) {
-            Ok(outcome) => {
-                consecutive_errors = 0;
-                let hash = match &outcome {
-                    Outcome::Copied(hash) => hash.clone(),
-                    Outcome::AlreadyThere(hash) => hash.clone().unwrap_or_default(),
-                };
-                let dest_str = dest.to_string_lossy().into_owned();
-                match outcome {
-                    Outcome::Copied(_) => {
-                        summary.copied += 1;
-                        summary.copied_bytes += f.size;
-                        progress.copied_bytes += f.size;
-                        progress.done_files += 1;
-                    }
-                    Outcome::AlreadyThere(_) => {
-                        // Same content already at destination — not a new copy.
-                        progress.done_files += 1;
-                        summary.skipped.push(Skipped {
-                            original_name: f.original_name.clone(),
-                            size: f.size,
-                            known: Some(dest_str.clone()),
-                        });
-                    }
-                }
-                // Index the content either way so future runs dedup against it.
-                let entry = crate::config::IndexEntry {
-                    hash,
-                    size: f.size,
-                    media_type: format!("{:?}", f.media_type),
-                    original_name: f.original_name.clone(),
-                    dest: dest_str,
-                    imported_at: jiff::Timestamp::now().to_string(),
-                };
-                if let Err(e) = append_index(&entry) {
-                    summary.errors.push(format!("index write failed: {e:#}"));
-                }
-            }
-            Err(e) => {
-                summary.errors.push(format!("{}: {e:#}", f.original_name));
-                consecutive_errors += 1;
-                // If the destination device has clearly vanished (unmount,
-                // cable pull, USB drop), stop hammering it and report once.
-                if consecutive_errors >= 25 {
-                    summary.errors.push(
-                        "ABORTED: the destination stopped responding after repeated \
-                         failures — is the SSD still connected? Files already copied \
-                         are kept and indexed; re-run when the drive is back."
-                            .to_string(),
-                    );
-                    break;
-                }
-            }
-        }
-        let _ = tx.send(progress.clone());
-    }
-
+    run_copies(&copies, index_path, cancel, &tx, &mut progress, &mut summary);
     progress.finished = true;
     progress.cancelled = summary.cancelled;
     let _ = tx.send(progress);
     Ok(summary)
 }
 
+/// Copy every planned file, tracking progress and halting on cancel or when
+/// the destination clearly stops responding.
+fn run_copies(
+    copies: &[&PlannedFile],
+    index_path: &Path,
+    cancel: &AtomicBool,
+    tx: &Sender<Progress>,
+    progress: &mut Progress,
+    summary: &mut Summary,
+) {
+    let mut consecutive_errors = 0usize;
+    for f in copies {
+        if cancel.load(Ordering::SeqCst) {
+            summary.cancelled = true;
+            break;
+        }
+        let Action::Copy { dest } = &f.action else { unreachable!() };
+        progress.current = f.original_name.clone();
+        let _ = tx.send(progress.clone());
+
+        match copy_one(&f.source, dest, f.hash.as_deref()) {
+            Ok(outcome) => {
+                consecutive_errors = 0;
+                record_outcome(outcome, f, dest, index_path, progress, summary);
+            }
+            Err(e) => {
+                summary.errors.push(format!("{}: {e:#}", f.original_name));
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    summary.errors.push(DEST_UNRESPONSIVE.to_string());
+                    break;
+                }
+            }
+        }
+        let _ = tx.send(progress.clone());
+    }
+}
+
+/// Record (as warnings) every file the plan says not to copy.
+fn collect_skips(plan: &Plan) -> Vec<Skipped> {
+    plan.files
+        .iter()
+        .filter_map(|f| match &f.action {
+            Action::SkipDuplicate { known } => Some(Skipped {
+                original_name: f.original_name.clone(),
+                size: f.size,
+                known: known.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Account for one finished copy attempt and index its content either way,
+/// so future runs dedup against it.
+fn record_outcome(
+    outcome: Outcome,
+    f: &PlannedFile,
+    dest: &Path,
+    index_path: &Path,
+    progress: &mut Progress,
+    summary: &mut Summary,
+) {
+    let hash = match &outcome {
+        Outcome::Copied(hash) => hash.clone(),
+        Outcome::AlreadyThere(hash) => hash.clone().unwrap_or_default(),
+    };
+    let dest_str = dest.to_string_lossy().into_owned();
+    match outcome {
+        Outcome::Copied(_) => {
+            summary.copied += 1;
+            summary.copied_bytes += f.size;
+            progress.copied_bytes += f.size;
+            progress.done_files += 1;
+        }
+        Outcome::AlreadyThere(_) => {
+            // Same content already at destination — not a new copy.
+            progress.done_files += 1;
+            summary.skipped.push(Skipped {
+                original_name: f.original_name.clone(),
+                size: f.size,
+                known: Some(dest_str.clone()),
+            });
+        }
+    }
+    let entry = crate::config::IndexEntry {
+        hash,
+        size: f.size,
+        media_type: format!("{:?}", f.media_type),
+        original_name: f.original_name.clone(),
+        dest: dest_str,
+        imported_at: jiff::Timestamp::now().to_string(),
+    };
+    if let Err(e) = crate::config::append_index_to(index_path, &entry) {
+        summary.errors.push(format!("index write failed: {e:#}"));
+    }
+}
+
+#[derive(Debug)]
 enum Outcome {
     /// New copy landed; hash computed during the copy.
     Copied(String),
@@ -166,7 +189,7 @@ enum Outcome {
     AlreadyThere(Option<String>),
 }
 
-fn copy_one(source: &Path, dest: &PathBuf, expected_hash: Option<&str>) -> Result<Outcome> {
+fn copy_one(source: &Path, dest: &Path, expected_hash: Option<&str>) -> Result<Outcome> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -188,7 +211,13 @@ fn copy_one(source: &Path, dest: &PathBuf, expected_hash: Option<&str>) -> Resul
         );
     }
 
-    // Streamed copy with inline hashing: one read pass for both.
+    let hash = stream_copy(source, dest, source_size)?;
+    Ok(Outcome::Copied(hash))
+}
+
+/// Streamed copy with inline hashing: one read pass for both. The copy is
+/// only "done" if the written length matches the source exactly.
+fn stream_copy(source: &Path, dest: &Path, source_size: u64) -> Result<String> {
     let source_file = fs::File::open(source)
         .with_context(|| format!("reading {}", source.display()))?;
     let mut reader = std::io::BufReader::with_capacity(1024 * 1024, source_file);
@@ -218,5 +247,188 @@ fn copy_one(source: &Path, dest: &PathBuf, expected_hash: Option<&str>) -> Resul
     if md.len() != written || written != source_size {
         anyhow::bail!("size mismatch after copy: {}", dest.display());
     }
-    Ok(Outcome::Copied(format!("{:x}", hasher.finalize())))
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::MediaType;
+    use std::sync::mpsc;
+    use tempfile::TempDir;
+
+    fn planned_copy(source: &Path, dest: &Path, size: u64, hash: Option<String>) -> PlannedFile {
+        PlannedFile {
+            source: source.to_path_buf(),
+            original_name: source
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            media_type: MediaType::Jpeg,
+            size,
+            hash,
+            date: None,
+            action: Action::Copy {
+                dest: dest.to_path_buf(),
+            },
+        }
+    }
+
+    fn last_progress(rx: &mpsc::Receiver<Progress>) -> Progress {
+        let mut last = Progress::default();
+        while let Ok(p) = rx.try_recv() {
+            last = p;
+        }
+        last
+    }
+
+    #[test]
+    fn copy_one_copies_and_hashes() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src.jpg");
+        std::fs::write(&source, "hello").unwrap();
+        let dest = tmp.path().join("out").join("dst.jpg");
+
+        let outcome = copy_one(&source, &dest, None).unwrap();
+        match outcome {
+            Outcome::Copied(hash) => {
+                assert_eq!(hash, crate::dedup::sha256_file(&source).unwrap());
+                assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+            }
+            _ => panic!("expected a fresh copy"),
+        }
+    }
+
+    #[test]
+    fn copy_one_skips_identical_content_at_destination() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src.jpg");
+        std::fs::write(&source, "hello").unwrap();
+        let dest = tmp.path().join("dst.jpg");
+        std::fs::write(&dest, "hello").unwrap();
+
+        let hash = crate::dedup::sha256_file(&source).unwrap();
+        match copy_one(&source, &dest, Some(&hash)).unwrap() {
+            Outcome::AlreadyThere(known) => assert_eq!(known.as_deref(), Some(hash.as_str())),
+            _ => panic!("expected AlreadyThere"),
+        }
+        // Content untouched.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn copy_one_never_overwrites_different_content() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("src.jpg");
+        std::fs::write(&source, "hello").unwrap();
+        let dest = tmp.path().join("dst.jpg");
+        std::fs::write(&dest, "something else").unwrap();
+
+        let err = copy_one(&source, &dest, None).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"something else");
+    }
+
+    #[test]
+    fn copy_one_fails_when_source_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let err = copy_one(&tmp.path().join("missing"), &tmp.path().join("dst.jpg"), None)
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn dry_run_records_skips_and_copies_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("a.jpg");
+        std::fs::write(&source, "data").unwrap();
+        let dest = tmp.path().join("out").join("a.jpg");
+        let plan = Plan {
+            files: vec![
+                planned_copy(&source, &dest, 4, None),
+                PlannedFile {
+                    source: source.clone(),
+                    original_name: "b.jpg".into(),
+                    media_type: MediaType::Jpeg,
+                    size: 9,
+                    hash: None,
+                    date: None,
+                    action: Action::SkipDuplicate { known: Some("/old".into()) },
+                },
+            ],
+        };
+        let (tx, rx) = mpsc::channel();
+        let summary = run(&plan, &tmp.path().join("index.json"), true, &AtomicBool::new(false), tx).unwrap();
+        assert_eq!(summary.copied, 0);
+        assert_eq!(summary.skipped.len(), 1);
+        assert_eq!(summary.skipped[0].original_name, "b.jpg");
+        assert!(last_progress(&rx).finished);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn run_copies_and_indexes_every_success() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("a.jpg");
+        std::fs::write(&source, "payload").unwrap();
+        let dest = tmp.path().join("out").join("a.jpg");
+        let index_path = tmp.path().join("index.json");
+        let plan = Plan {
+            files: vec![planned_copy(&source, &dest, 7, None)],
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let summary = run(&plan, &index_path, false, &AtomicBool::new(false), tx).unwrap();
+
+        assert_eq!(summary.copied, 1);
+        assert_eq!(summary.copied_bytes, 7);
+        assert!(summary.errors.is_empty());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        let p = last_progress(&rx);
+        assert!(p.finished && p.done_files == 1 && p.total_files == 1 && p.copied_bytes == 7);
+
+        let index = crate::config::load_index_from(&index_path).unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].dest, dest.to_string_lossy());
+        assert_eq!(index.entries[0].size, 7);
+    }
+
+    #[test]
+    fn cancelled_run_copies_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("a.jpg");
+        std::fs::write(&source, "payload").unwrap();
+        let dest = tmp.path().join("out").join("a.jpg");
+        let plan = Plan {
+            files: vec![planned_copy(&source, &dest, 7, None)],
+        };
+        let (tx, _rx) = mpsc::channel();
+        let summary = run(&plan, &tmp.path().join("index.json"), false, &AtomicBool::new(true), tx).unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.copied, 0);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn run_aborts_after_repeated_destination_failures() {
+        let tmp = TempDir::new().unwrap();
+        // 30 planned copies whose sources do not exist → 30 straight errors;
+        // the loop must stop hammering after 25 and report once.
+        let files: Vec<PlannedFile> = (0..30)
+            .map(|i| {
+                planned_copy(
+                    &tmp.path().join(format!("missing-{i}.jpg")),
+                    &tmp.path().join(format!("out/{i}.jpg")),
+                    1,
+                    None,
+                )
+            })
+            .collect();
+        let plan = Plan { files };
+        let (tx, _rx) = mpsc::channel();
+        let summary = run(&plan, &tmp.path().join("index.json"), false, &AtomicBool::new(false), tx).unwrap();
+        assert!(summary.errors.iter().any(|e| e.contains("ABORTED")));
+        assert!(summary.errors.len() <= MAX_CONSECUTIVE_ERRORS + 1);
+        assert!(summary.copied == 0 && !summary.cancelled);
+    }
 }

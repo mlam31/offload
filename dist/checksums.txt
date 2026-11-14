@@ -1,0 +1,4 @@
+6a8d3d352ed96c945b3533a065987af35c57e2f29cb99814efebd768001029b3  dist/offload-v0.1.1-aarch64-apple-darwin.tar.gz
+c93e748d5f8cc5cc2ed73699d52493159e2f91d650684c0ffa98afe87e4fec8a  dist/offload-v0.1.1-x86_64-apple-darwin.tar.gz
+c8976db76d0777f03df72f84dc641025e66d03fb13a5db3abc2d150a9ab593dc  dist/offload-v0.1.1-x86_64-pc-windows-gnu.zip
+c858477bdcef9bcaa23fea2f8e3c8d1edc0abaa731a4cea882a2073f082d40a2  dist/offload-v0.1.1-x86_64-unknown-linux-musl.tar.gz

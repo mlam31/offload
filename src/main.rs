@@ -1,18 +1,7 @@
-mod cli;
-mod config;
-mod dedup;
-mod detect;
-mod disk;
-mod eject;
-mod headless;
-mod import;
-mod media;
-mod plan;
-mod scan;
-mod tui;
-
 use clap::Parser;
-use cli::Cli;
+
+use offload::cli::Cli;
+use offload::{config, detect, headless, tui};
 
 fn main() {
     let args = Cli::parse();

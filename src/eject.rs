@@ -75,59 +75,62 @@ fn processes_using(mount: &Path) -> Vec<String> {
 /// files open on it. Returns a human-readable report either way.
 pub fn eject_if_unused(path: &Path) -> EjectReport {
     match volume_info(path) {
-        Ok(info) => {
-            if info.device.starts_with("/dev/disk") && info.device.contains("disk0") {
-                return EjectReport {
-                    mount: info.mount,
-                    message: "that's the system disk — refusing".to_string(),
-                    ejected: false,
-                };
-            }
-            let Some(mount) = info.mount else {
-                return EjectReport {
-                    mount: None,
-                    message: "volume not mounted".to_string(),
-                    ejected: false,
-                };
-            };
-            let users = processes_using(&mount);
-            if !users.is_empty() {
-                return EjectReport {
-                    mount: Some(mount),
-                    message: format!(
-                        "in use — kept mounted (open by: {})",
-                        users.join(", ")
-                    ),
-                    ejected: false,
-                };
-            }
-            match Command::new("diskutil").arg("eject").arg(&info.device).output() {
-                Ok(out) if out.status.success() => EjectReport {
-                    mount: Some(mount),
-                    message: "ejected ✓ (safe to unplug)".to_string(),
-                    ejected: true,
-                },
-                Ok(out) => {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    EjectReport {
-                        mount: Some(mount),
-                        message: format!(
-                            "could not eject: {}",
-                            err.trim().split('\n').next().unwrap_or("unknown error")
-                        ),
-                        ejected: false,
-                    }
-                }
-                Err(e) => EjectReport {
-                    mount: Some(mount),
-                    message: format!("could not run diskutil: {e}"),
-                    ejected: false,
-                },
-            }
-        }
+        Ok(info) => eject_volume(info),
         Err(e) => EjectReport {
             mount: None,
             message: format!("cannot resolve volume: {e:#}"),
+            ejected: false,
+        },
+    }
+}
+
+fn eject_volume(info: VolInfo) -> EjectReport {
+    if info.device.starts_with("/dev/disk") && info.device.contains("disk0") {
+        return EjectReport {
+            mount: info.mount,
+            message: "that's the system disk — refusing".to_string(),
+            ejected: false,
+        };
+    }
+    let Some(mount) = info.mount else {
+        return EjectReport {
+            mount: None,
+            message: "volume not mounted".to_string(),
+            ejected: false,
+        };
+    };
+    let users = processes_using(&mount);
+    if !users.is_empty() {
+        return EjectReport {
+            mount: Some(mount),
+            message: format!("in use — kept mounted (open by: {})", users.join(", ")),
+            ejected: false,
+        };
+    }
+    eject_device(&info.device, mount)
+}
+
+fn eject_device(device: &str, mount: PathBuf) -> EjectReport {
+    match Command::new("diskutil").arg("eject").arg(device).output() {
+        Ok(out) if out.status.success() => EjectReport {
+            mount: Some(mount),
+            message: "ejected ✓ (safe to unplug)".to_string(),
+            ejected: true,
+        },
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            EjectReport {
+                mount: Some(mount),
+                message: format!(
+                    "could not eject: {}",
+                    err.trim().split('\n').next().unwrap_or("unknown error")
+                ),
+                ejected: false,
+            }
+        }
+        Err(e) => EjectReport {
+            mount: Some(mount),
+            message: format!("could not run diskutil: {e}"),
             ejected: false,
         },
     }

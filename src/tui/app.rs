@@ -12,9 +12,9 @@ use ratatui::{
 };
 
 use crate::detect::SourceInfo;
-use crate::headless::{gb, mb};
+use crate::headless::{ellipsize, gb, mb};
 use crate::import::{Progress, Summary};
-use crate::plan::Plan;
+use crate::plan::{date_folder, Plan};
 use crate::tui::tree::Tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +88,6 @@ impl App {
 const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
 
 /// ---------- drawing ----------
-
 pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Browser => draw_browser(f, app),
@@ -105,27 +104,17 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
 
     // Left: drive tree.
     let rows = app.tree.rows();
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|r| {
-            let indent = "  ".repeat(r.depth);
-            let marker = if r.is_dir {
-                if r.expanded { "▾ " } else { "▸ " }
-            } else {
-                "  "
-            };
-            let style = if r.is_dir {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(Span::styled(
-                format!("{indent}{marker}{}", r.name),
-                style,
-            )))
-        })
-        .collect();
-    let list = List::new(items)
+    let list = drive_list(&rows);
+    f.render_stateful_widget(list, left, &mut app.list_state);
+
+    // Right: info panel.
+    let selected = app.tree.selected();
+    f.render_widget(info_panel(app, selected), right);
+}
+
+fn drive_list(rows: &[crate::tui::tree::Row]) -> List<'static> {
+    let items: Vec<ListItem> = rows.iter().map(row_item).collect();
+    List::new(items)
         .block(
             Block::new()
                 .borders(Borders::ALL)
@@ -135,97 +124,131 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
             Style::default()
                 .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
-        );
-    f.render_stateful_widget(list, left, &mut app.list_state);
+        )
+}
 
-    // Right: info panel.
-    let selected = app.tree.selected();
-    let mut lines: Vec<Line> = Vec::new();
-
-    lines.push(Line::from(Span::styled(
-        "offload",
+fn row_item(r: &crate::tui::tree::Row) -> ListItem<'static> {
+    let indent = "  ".repeat(r.depth);
+    let marker = if r.is_dir {
+        if r.expanded { "▾ " } else { "▸ " }
+    } else {
+        "  "
+    };
+    let style = if r.is_dir {
+        Style::default().fg(Color::Cyan)
+    } else {
         Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
+    };
+    ListItem::new(Line::from(Span::styled(
+        format!("{indent}{marker}{}", r.name),
+        style,
+    )))
+}
 
-    match &app.source {
-        Some(src) => {
-            lines.push(Line::from(vec![
+fn info_panel(app: &App, selected: Option<crate::tui::tree::Row>) -> Paragraph<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.extend(header_lines());
+    lines.extend(source_lines(app.source.as_ref()));
+    lines.push(Line::from(""));
+    lines.push(destination_line(app.dest.as_ref()));
+    lines.push(Line::from(""));
+    if let Some(sel) = &selected {
+        lines.push(Line::from(format!(
+            "Cursor: {}",
+            sel.path.to_string_lossy()
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.extend(settings_lines(app));
+    if let Some(err) = &app.error {
+        lines.extend(error_lines(err));
+    }
+
+    Paragraph::new(lines)
+        .block(Block::new().borders(Borders::ALL).title(" Info "))
+        .wrap(Wrap { trim: true })
+}
+
+fn header_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "offload",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ]
+}
+
+fn source_lines(source: Option<&SourceInfo>) -> Vec<Line<'static>> {
+    match source {
+        Some(src) => vec![
+            Line::from(vec![
                 Span::styled("Card detected: ", Style::default().fg(Color::Green)),
                 Span::raw(src.root.to_string_lossy().into_owned()),
-            ]));
-            lines.push(Line::from(format!(
+            ]),
+            Line::from(format!(
                 "  {} files, {:.1} GB ready to offload",
                 src.total_count(),
                 gb(src.total_bytes())
-            )));
-        }
-        None => {
-            lines.push(Line::from(Span::styled(
-                "No camera card detected. Connect the SD card, or browse and pick any folder as source manually later.",
-                Style::default().fg(Color::Yellow),
-            )));
-        }
+            )),
+        ],
+        None => vec![Line::from(Span::styled(
+            "No camera card detected. Connect the SD card, or browse and pick any folder as source manually later.",
+            Style::default().fg(Color::Yellow),
+        ))],
     }
-    lines.push(Line::from(""));
+}
 
-    lines.push(Line::from(vec![
+fn destination_line(dest: Option<&PathBuf>) -> Line<'static> {
+    Line::from(vec![
         Span::styled("Destination: ", Style::default().fg(Color::Green)),
         Span::raw(
-            app.dest
-                .as_ref()
-                .map(|d| d.to_string_lossy().into_owned())
+            dest.map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "not set (Enter on a folder)".into()),
         ),
-    ]));
-    lines.push(Line::from(""));
+    ])
+}
 
-    if let Some(sel) = &selected {
-        lines.push(Line::from(format!("Cursor: {}", sel.path.to_string_lossy())));
-    }
-    lines.push(Line::from(""));
+fn settings_lines(app: &App) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Settings",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "  [r] rename on import : {}",
+            on_off(app.rename)
+        )),
+        Line::from(format!(
+            "  [d] dry run          : {}",
+            on_off(app.dry_run)
+        )),
+        Line::from(format!(
+            "  [f] force re-import  : {}",
+            on_off(app.force)
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Keys: Enter on expanded folder = set destination",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "      q quit",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
 
-    lines.push(Line::from(Span::styled(
-        "Settings",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(format!(
-        "  [r] rename on import : {}",
-        on_off(app.rename)
-    )));
-    lines.push(Line::from(format!(
-        "  [d] dry run          : {}",
-        on_off(app.dry_run)
-    )));
-    lines.push(Line::from(format!(
-        "  [f] force re-import  : {}",
-        on_off(app.force)
-    )));
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Keys: Enter on expanded folder = set destination",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "      q quit",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    if let Some(err) = &app.error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+fn error_lines(err: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        Line::from(Span::styled(
             format!("⚠ {err}"),
             Style::default().fg(Color::Red),
-        )));
-    }
-
-    let para = Paragraph::new(lines)
-        .block(Block::new().borders(Borders::ALL).title(" Info "))
-        .wrap(Wrap { trim: true });
-    f.render_widget(para, right);
+        )),
+    ]
 }
 
 fn draw_planning(f: &mut Frame, app: &mut App) {
@@ -273,40 +296,17 @@ fn draw_planning(f: &mut Frame, app: &mut App) {
 
 fn draw_confirm(f: &mut Frame, app: &mut App) {
     let Some(plan) = &app.plan else { return };
+    centered(f, " Confirm import ", confirm_lines(app, plan), 70);
+}
+
+fn confirm_lines(app: &App, plan: &Plan) -> Vec<Line<'static>> {
     let st = plan.stats();
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("Destination: ", Style::default().fg(Color::Green)),
-        Span::raw(
-            app.dest
-                .as_ref()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        ),
-    ]));
+    lines.push(destination_line(app.dest.as_ref()));
     lines.push(Line::from(""));
-
-    if st.dates.is_empty() {
-        lines.push(Line::from("Nothing to import."));
-    }
-    for date in &st.dates {
-        let folder = format!(
-            "{:02}-{:02}-{:04}",
-            date.day(),
-            date.month() as i64,
-            date.year()
-        );
-        let count = plan
-            .files
-            .iter()
-            .filter(|f| f.is_copy() && f.date == Some(*date))
-            .count();
-        lines.push(Line::from(format!(
-            "  {folder}/   {count} files"
-        )));
-    }
+    lines.extend(date_lines(plan, &st));
     lines.push(Line::from(""));
     for (mt, (count, bytes)) in &st.by_type {
         lines.push(Line::from(format!(
@@ -341,8 +341,24 @@ fn draw_confirm(f: &mut Frame, app: &mut App) {
         "Enter = start   Esc = back   q = quit",
         Style::default().fg(Color::Cyan),
     )));
+    lines
+}
 
-    centered(f, " Confirm import ", lines, 70);
+fn date_lines(plan: &Plan, st: &crate::plan::PlanStats) -> Vec<Line<'static>> {
+    if st.dates.is_empty() {
+        return vec![Line::from("Nothing to import.")];
+    }
+    st.dates
+        .iter()
+        .map(|date| {
+            let count = plan
+                .files
+                .iter()
+                .filter(|f| f.is_copy() && f.date == Some(*date))
+                .count();
+            Line::from(format!("  {}/   {count} files", date_folder(*date)))
+        })
+        .collect()
 }
 
 fn draw_progress(f: &mut Frame, app: &mut App) {
@@ -382,7 +398,15 @@ fn draw_progress(f: &mut Frame, app: &mut App) {
 
 fn draw_summary(f: &mut Frame, app: &mut App) {
     let Some(s) = &app.summary else { return };
-    let mut lines = Vec::new();
+    let para = Paragraph::new(summary_lines(app, s))
+        .block(Block::new().borders(Borders::ALL).title(" Summary "))
+        .wrap(Wrap { trim: true })
+        .scroll((app.summary_scroll as u16, 0));
+    f.render_widget(para, f.area());
+}
+
+fn summary_lines(app: &App, s: &Summary) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(""));
     if s.cancelled {
         lines.push(Line::from(Span::styled(
@@ -413,34 +437,8 @@ fn draw_summary(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Red),
         )));
     }
-    if !s.skipped.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "⚠ Already imported — skipped:",
-            Style::default().fg(Color::Yellow),
-        )));
-        for sk in &s.skipped {
-            let known = sk
-                .known
-                .as_deref()
-                .unwrap_or("(same content)");
-            lines.push(Line::from(format!(
-                "  {}  →  {}  ({:.1} MB)",
-                sk.original_name,
-                known,
-                mb(sk.size)
-            )));
-        }
-    }
-    if !s.errors.is_empty() {
-        lines.push(Line::from(""));
-        for e in &s.errors {
-            lines.push(Line::from(Span::styled(
-                format!("  {e}"),
-                Style::default().fg(Color::Red),
-            )));
-        }
-    }
+    lines.extend(summary_skip_lines(s));
+    lines.extend(summary_error_lines(s));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "q / Enter = quit    e = eject card + SSD    s = eject card only",
@@ -452,12 +450,44 @@ fn draw_summary(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Green),
         )));
     }
+    lines
+}
 
-    let para = Paragraph::new(lines)
-        .block(Block::new().borders(Borders::ALL).title(" Summary "))
-        .wrap(Wrap { trim: true })
-        .scroll((app.summary_scroll as u16, 0));
-    f.render_widget(para, f.area());
+fn summary_skip_lines(s: &Summary) -> Vec<Line<'static>> {
+    if s.skipped.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "⚠ Already imported — skipped:",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    for sk in &s.skipped {
+        let known = sk.known.as_deref().unwrap_or("(same content)");
+        lines.push(Line::from(format!(
+            "  {}  →  {}  ({:.1} MB)",
+            sk.original_name,
+            known,
+            mb(sk.size)
+        )));
+    }
+    lines
+}
+
+fn summary_error_lines(s: &Summary) -> Vec<Line<'static>> {
+    if s.errors.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from("")];
+    for e in &s.errors {
+        lines.push(Line::from(Span::styled(
+            format!("  {e}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines
 }
 
 fn centered(f: &mut Frame, title: &str, lines: Vec<Line>, width_pct: u16) {
@@ -488,14 +518,61 @@ fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
 
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().rev().take(max - 1).collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        format!("…{cut}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn on_off_renders_booleans() {
+        assert_eq!(on_off(true), "on");
+        assert_eq!(on_off(false), "off");
+    }
+
+    #[test]
+    fn centered_rect_shrinks_the_parent_area() {
+        let parent = Rect::new(0, 0, 100, 100);
+        let r = centered_rect(70, 55, parent);
+        assert!(r.width > 0 && r.width < parent.width);
+        assert!(r.height > 0 && r.height < parent.height);
+        // Roughly centered horizontally.
+        let left_margin = r.x - parent.x;
+        let right_margin = (parent.x + parent.width) - (r.x + r.width);
+        assert!(
+            (left_margin as i32 - right_margin as i32).abs() <= 2,
+            "left {left_margin} vs right {right_margin}"
+        );
+    }
+
+    #[test]
+    fn new_app_picks_up_existing_last_dest_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let existing = tmp.path().join("exists");
+        std::fs::create_dir_all(&existing).unwrap();
+        let missing = tmp.path().join("missing");
+
+        let app = App::new(None, Some(existing.to_string_lossy().into_owned()));
+        assert_eq!(app.dest.as_deref(), Some(existing.as_path()));
+        assert_eq!(app.screen, Screen::Browser);
+        assert!(app.rename && !app.force && !app.dry_run);
+
+        let app = App::new(None, Some(missing.to_string_lossy().into_owned()));
+        assert_eq!(app.dest, None);
+
+        let app = App::new(None, None);
+        assert_eq!(app.dest, None);
+    }
+
+    #[test]
+    fn new_app_keeps_detected_source() {
+        let src = SourceInfo {
+            root: PathBuf::from("/Volumes/CARD"),
+            files: Vec::new(),
+        };
+        let app = App::new(Some(src), None);
+        assert!(app.source.is_some());
+        let src = app.source.as_ref().unwrap();
+        assert_eq!(src.total_count(), 0);
+        assert_eq!(src.total_bytes(), 0);
     }
 }

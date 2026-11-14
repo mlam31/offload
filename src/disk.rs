@@ -2,7 +2,6 @@ use std::path::Path;
 
 /// Free space available to unprivileged users at `path`.
 /// Per-OS: statvfs on macOS/Linux, GetDiskFreeSpaceExW on Windows.
-
 #[cfg(unix)]
 pub fn free_bytes(path: &Path) -> Option<u64> {
     let cpath = std::ffi::CString::new(path.as_os_str().to_string_lossy().as_bytes()).ok()?;
@@ -35,5 +34,23 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
         Some(avail)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_positive_free_space_for_existing_path() {
+        let free = free_bytes(Path::new(".")).expect("statvfs on cwd should succeed");
+        assert!(free > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn returns_none_for_missing_path() {
+        assert_eq!(free_bytes(Path::new("/nonexistent-offload-probe")), None);
     }
 }
