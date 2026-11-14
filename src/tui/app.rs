@@ -47,6 +47,7 @@ pub struct App {
     pub dry_run: bool,
     pub spinner: usize,
     pub summary_scroll: usize,
+    pub eject_status: Vec<String>,
 }
 
 impl App {
@@ -75,6 +76,7 @@ impl App {
             dry_run: false,
             spinner: 0,
             summary_scroll: 0,
+            eject_status: Vec::new(),
         }
     }
 
@@ -441,9 +443,15 @@ fn draw_summary(f: &mut Frame, app: &mut App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "q / Enter = quit",
+        "q / Enter = quit    e = eject card + SSD    s = eject card only",
         Style::default().fg(Color::Cyan),
     )));
+    for status in &app.eject_status {
+        lines.push(Line::from(Span::styled(
+            format!("  {status}"),
+            Style::default().fg(Color::Green),
+        )));
+    }
 
     let para = Paragraph::new(lines)
         .block(Block::new().borders(Borders::ALL).title(" Summary "))

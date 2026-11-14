@@ -3,6 +3,7 @@ mod config;
 mod dedup;
 mod detect;
 mod disk;
+mod eject;
 mod headless;
 mod import;
 mod media;
@@ -24,6 +25,7 @@ fn main() {
                 dry_run: args.dry_run,
                 rename: !args.no_rename,
                 force: args.force,
+                eject: args.eject,
             }),
             _ => {
                 eprintln!("error: --src and --dest must be used together (omit both for the interactive UI)");

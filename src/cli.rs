@@ -26,4 +26,8 @@ pub struct Cli {
     /// Re-import files even if their content hash is already in the import index.
     #[arg(long)]
     pub force: bool,
+
+    /// Eject the card and destination drive after a clean import (headless only).
+    #[arg(long)]
+    pub eject: bool,
 }

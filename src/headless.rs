@@ -17,6 +17,7 @@ pub struct HeadlessArgs {
     pub dry_run: bool,
     pub rename: bool,
     pub force: bool,
+    pub eject: bool,
 }
 
 /// Non-interactive mode: scan, hash, plan, copy, report.
@@ -159,6 +160,18 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<()> {
         for e in &summary.errors {
             println!("  {e}");
         }
+    }
+
+    if args.eject && !summary.cancelled && summary.errors.is_empty() {
+        println!();
+        println!(
+            "card: {}",
+            crate::eject::eject_if_unused(&args.src).message
+        );
+        println!(
+            "SSD:  {}",
+            crate::eject::eject_if_unused(&args.dest).message
+        );
     }
     Ok(())
 }

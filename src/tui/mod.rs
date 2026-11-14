@@ -142,9 +142,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         Screen::Summary => match key.code {
-            _ if is_quit(&key) || key.code == KeyCode::Enter => return true,
             KeyCode::Up => app.summary_scroll = app.summary_scroll.saturating_sub(1),
             KeyCode::Down => app.summary_scroll += 1,
+            KeyCode::Char('e') => eject_volumes(app, true),
+            KeyCode::Char('s') => eject_volumes(app, false),
+            _ if is_quit(&key) || key.code == KeyCode::Enter => return true,
             _ => {}
         },
     }
@@ -216,6 +218,27 @@ fn start_planning(app: &mut App) {
         let result = build_plan(files, &index, &dest, opts, Some(&hash_tx));
         let _ = tx.send(result);
     });
+}
+
+/// Eject the card (and optionally the SSD) after a completed import.
+/// Each volume is only ejected if no other process has files open on it.
+fn eject_volumes(app: &mut App, include_dest: bool) {
+    let mut status = Vec::new();
+    if let Some(src) = &app.source {
+        status.push(format!(
+            "card: {}",
+            crate::eject::eject_if_unused(&src.root).message
+        ));
+    }
+    if include_dest {
+        if let Some(dest) = &app.dest {
+            status.push(format!(
+                "SSD: {}",
+                crate::eject::eject_if_unused(dest).message
+            ));
+        }
+    }
+    app.eject_status.extend(status);
 }
 
 fn start_import(app: &mut App) {
