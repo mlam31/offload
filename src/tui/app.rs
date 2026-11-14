@@ -34,6 +34,8 @@ pub struct App {
     pub dest: Option<PathBuf>,
     pub plan: Option<Plan>,
     pub plan_rx: Option<Receiver<anyhow::Result<Plan>>>,
+    pub hash_rx: Option<Receiver<(usize, usize)>>,
+    pub hash_progress: (usize, usize),
     pub progress: Option<Progress>,
     pub import_rx: Option<Receiver<Progress>>,
     pub summary_rx: Option<Receiver<Summary>>,
@@ -60,6 +62,8 @@ impl App {
             dest,
             plan: None,
             plan_rx: None,
+            hash_rx: None,
+            hash_progress: (0, 0),
             progress: None,
             import_rx: None,
             summary_rx: None,
@@ -224,22 +228,45 @@ fn draw_browser(f: &mut Frame, app: &mut App) {
 
 fn draw_planning(f: &mut Frame, app: &mut App) {
     let icon = SPINNER[app.spinner % SPINNER.len()];
-    let text = vec![
+    let (done, total) = app.hash_progress;
+    let ratio = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+
+    let [_, middle, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(7),
+        Constraint::Fill(1),
+    ])
+    .areas(f.area());
+    let [_, mid, _] = Layout::horizontal([
+        Constraint::Percentage(20),
+        Constraint::Fill(1),
+        Constraint::Percentage(20),
+    ])
+    .areas(middle);
+
+    let gauge = Gauge::default()
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" Fingerprinting for dedup "),
+        )
+        .ratio(ratio.min(1.0))
+        .label(format!(
+            "{icon}  {done} / {total} files hashed  ({:.0}%)",
+            ratio * 100.0
+        ))
+        .gauge_style(Style::default().fg(Color::Cyan));
+    f.render_widget(gauge, mid);
+
+    let note = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("{icon}  Hashing card files for dedup…"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Large cards take a moment — this is the fingerprinting pass.",
+            "Only files that could be duplicates are fingerprinted (same size as an\nimported file or as another file on the card). Everything else gets its\nhash computed during the copy itself — no extra pass, no extra time.",
             Style::default().fg(Color::DarkGray),
         )),
-    ];
-    centered(f, " Working ", text, 60);
-    let _ = app;
+    ])
+    .alignment(Alignment::Center);
+    f.render_widget(note, f.area());
 }
 
 fn draw_confirm(f: &mut Frame, app: &mut App) {

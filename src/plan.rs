@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 
 use anyhow::Result;
 use jiff::civil::Date;
@@ -25,7 +26,10 @@ pub struct PlannedFile {
     pub original_name: String,
     pub media_type: MediaType,
     pub size: u64,
-    pub hash: String,
+    /// Content hash when we computed one. `None` means the size is unique on
+    /// the card AND absent from the import index, so the file provably cannot
+    /// be a duplicate — the hash is computed during the copy instead.
+    pub hash: Option<String>,
     pub date: Option<Date>,
     pub action: Action,
 }
@@ -93,29 +97,67 @@ impl Plan {
     }
 }
 
-/// Build the plan: hash every card file, resolve dedup, assign destination
-/// names. Rename-on-import numbers files per (capture date, type) in original
-/// camera order (Sony names are zero-padded, so plain sorting is correct).
+/// Progress of the hashing phase: (files hashed so far, files that need it).
+pub type HashProgress = (usize, usize);
+
+/// Build the plan: hash only the files that could be duplicates (same size as
+/// an index entry, or same size as another card file), resolve dedup, assign
+/// destination names. Rename-on-import numbers files per (capture date, type)
+/// in original camera order (Sony names are zero-padded, so plain sorting is
+/// correct).
 pub fn build_plan(
     mut files: Vec<MediaFile>,
     index: &Index,
     dest_root: &Path,
     opts: PlanOptions,
+    hash_progress: Option<&Sender<HashProgress>>,
 ) -> Result<Plan> {
     let mut planned: Vec<PlannedFile> = Vec::with_capacity(files.len());
+
+    // Files whose size matches an index entry could be re-imports.
+    let index_sizes: Vec<u64> = index.entries.iter().map(|e| e.size).collect();
+
+    // Files whose size matches another card file could be intra-batch dupes.
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut size_counts: HashMap<u64, usize> = HashMap::new();
+    for f in &files {
+        *size_counts.entry(f.size).or_default() += 1;
+    }
+
+    let to_hash: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| index_sizes.contains(&f.size) || size_counts[&f.size] > 1)
+        .map(|(i, _)| i)
+        .collect();
+    let total_hash = to_hash.len();
+    let mut hashed_so_far = 0usize;
+    if let Some(tx) = hash_progress {
+        let _ = tx.send((0, total_hash));
+    }
+
+    let mut hashes: Vec<Option<String>> = vec![None; files.len()];
+    for &i in &to_hash {
+        match sha256_file(&files[i].path) {
+            Ok(h) => hashes[i] = Some(h),
+            Err(_) => hashes[i] = None, // unreadable: still copy, report later
+        }
+        hashed_so_far += 1;
+        if let Some(tx) = hash_progress {
+            let _ = tx.send((hashed_so_far, total_hash));
+        }
+    }
 
     // Hash → index of the first planned copy with that content, for
     // intra-batch dedup. Resolved to the final destination after numbering.
     let mut batch_hashes: HashMap<String, usize> = HashMap::new();
     let mut pending_dups: Vec<usize> = Vec::new();
 
-    files.sort_by(|a, b| a.name.cmp(&b.name));
+    for (i, f) in files.iter().enumerate() {
+        let hash = hashes[i].clone();
 
-    for f in &files {
-        let hash = sha256_file(&f.path)?;
-
-        if !opts.force {
-            if let Some(known) = find_by_hash(index, &hash) {
+        if let (Some(h), false) = (hash.as_deref(), opts.force) {
+            if let Some(known) = find_by_hash(index, h) {
                 planned.push(PlannedFile {
                     source: f.path.clone(),
                     original_name: f.name.clone(),
@@ -132,18 +174,20 @@ pub fn build_plan(
         }
 
         // Intra-batch duplicate (same content appearing twice on the card).
-        if batch_hashes.contains_key(&hash) {
-            pending_dups.push(planned.len());
-            planned.push(PlannedFile {
-                source: f.path.clone(),
-                original_name: f.name.clone(),
-                media_type: f.media_type,
-                size: f.size,
-                hash,
-                date: f.date,
-                action: Action::SkipDuplicate { known: None },
-            });
-            continue;
+        if let Some(h) = &hash {
+            if batch_hashes.contains_key(h) {
+                pending_dups.push(planned.len());
+                planned.push(PlannedFile {
+                    source: f.path.clone(),
+                    original_name: f.name.clone(),
+                    media_type: f.media_type,
+                    size: f.size,
+                    hash,
+                    date: f.date,
+                    action: Action::SkipDuplicate { known: None },
+                });
+                continue;
+            }
         }
 
         let date = f.date;
@@ -153,8 +197,10 @@ pub fn build_plan(
         } else {
             f.name.clone()
         };
-        let dest = unique_dest(&dir, &base, f.size, Some(&hash));
-        batch_hashes.insert(hash.clone(), planned.len());
+        let dest = unique_dest(&dir, &base, f.size, hash.as_deref());
+        if let Some(h) = &hash {
+            batch_hashes.insert(h.clone(), planned.len());
+        }
         planned.push(PlannedFile {
             source: f.path.clone(),
             original_name: f.name.clone(),
@@ -182,7 +228,7 @@ pub fn build_plan(
                 let name = seq_name(date, planned[i].media_type, n + 1);
                 let dir = sub_dir(dest_root, date, planned[i].media_type);
                 let hash = planned[i].hash.clone();
-                let dest = unique_dest(&dir, &name, planned[i].size, Some(&hash));
+                let dest = unique_dest(&dir, &name, planned[i].size, hash.as_deref());
                 planned[i].action = Action::Copy { dest };
             }
         }
@@ -191,11 +237,13 @@ pub fn build_plan(
     // Resolve intra-batch duplicate references now that numbering is final.
     for dup_idx in pending_dups {
         let hash = planned[dup_idx].hash.clone();
-        if let Some(&first) = batch_hashes.get(&hash) {
-            if let Action::Copy { dest } = &planned[first].action {
-                planned[dup_idx].action = Action::SkipDuplicate {
-                    known: Some(dest.to_string_lossy().into_owned()),
-                };
+        if let Some(h) = hash {
+            if let Some(&first) = batch_hashes.get(&h) {
+                if let Action::Copy { dest } = &planned[first].action {
+                    planned[dup_idx].action = Action::SkipDuplicate {
+                        known: Some(dest.to_string_lossy().into_owned()),
+                    };
+                }
             }
         }
     }

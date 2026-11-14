@@ -7,13 +7,13 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{load_index, save_last_dest};
 use crate::disk::free_bytes;
 use crate::headless::gb;
 use crate::import::run;
-use crate::plan::{build_plan, Action, PlanOptions};
+use crate::plan::{build_plan, Action, HashProgress, Plan, PlanOptions};
 use crate::scan::scan_source;
 use app::{App, Screen};
 
@@ -25,6 +25,13 @@ pub fn run_tui(
     cli_force: bool,
     cli_dry_run: bool,
 ) -> Result<()> {
+    // Restore the terminal even if something panics mid-run.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::try_restore();
+        default_hook(info);
+    }));
+
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, source, last_dest, cli_rename, cli_force, cli_dry_run);
     ratatui::restore();
@@ -60,7 +67,7 @@ fn event_loop(
         if event::poll(tick)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if handle_key(&mut app, key.code) {
+                    if handle_key(&mut app, key) {
                         return Ok(());
                     }
                 }
@@ -73,11 +80,17 @@ fn event_loop(
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode) -> bool {
+fn is_quit(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        || (matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match app.screen {
         Screen::Browser => {
-            match code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            match key.code {
+                _ if is_quit(&key) => return true,
                 KeyCode::Up => app.tree.move_cursor(-1),
                 KeyCode::Down => app.tree.move_cursor(1),
                 KeyCode::Left => app.tree.collapse_selected(),
@@ -110,26 +123,26 @@ fn handle_key(app: &mut App, code: KeyCode) -> bool {
             app.sync_list_state();
         }
         Screen::Planning => {
-            if matches!(code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+            if is_quit(&key) {
                 return true;
             }
         }
-        Screen::Confirm => match code {
+        Screen::Confirm => match key.code {
             KeyCode::Esc => {
                 app.screen = Screen::Browser;
                 app.plan = None;
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+            _ if is_quit(&key) => return true,
             KeyCode::Enter => start_import(app),
             _ => {}
         },
         Screen::Progress => {
-            if matches!(code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+            if is_quit(&key) {
                 app.cancel.store(true, Ordering::SeqCst);
             }
         }
-        Screen::Summary => match code {
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Enter => return true,
+        Screen::Summary => match key.code {
+            _ if is_quit(&key) || key.code == KeyCode::Enter => return true,
             KeyCode::Up => app.summary_scroll = app.summary_scroll.saturating_sub(1),
             KeyCode::Down => app.summary_scroll += 1,
             _ => {}
@@ -192,12 +205,15 @@ fn start_planning(app: &mut App) {
         rename: app.rename,
         force: app.force,
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<anyhow::Result<Plan>>();
+    let (hash_tx, hash_rx) = mpsc::channel::<HashProgress>();
     app.plan_rx = Some(rx);
+    app.hash_rx = Some(hash_rx);
+    app.hash_progress = (0, 0);
     app.plan = None;
     app.screen = Screen::Planning;
     std::thread::spawn(move || {
-        let result = build_plan(files, &index, &dest, opts);
+        let result = build_plan(files, &index, &dest, opts, Some(&hash_tx));
         let _ = tx.send(result);
     });
 }
@@ -231,9 +247,19 @@ fn start_import(app: &mut App) {
 fn pump_background(app: &mut App) {
     // Planning finished?
     if app.screen == Screen::Planning {
+        if let Some(hash_rx) = &app.hash_rx {
+            let mut latest: Option<HashProgress> = None;
+            while let Ok(p) = hash_rx.try_recv() {
+                latest = Some(p);
+            }
+            if let Some(p) = latest {
+                app.hash_progress = p;
+            }
+        }
         if let Some(rx) = &app.plan_rx {
             if let Ok(result) = rx.try_recv() {
                 app.plan_rx = None;
+                app.hash_rx = None;
                 match result {
                     Ok(plan) => {
                         let st = plan.stats();

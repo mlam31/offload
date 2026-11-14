@@ -1,9 +1,11 @@
 use std::fs;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::config::{append_index, Index};
 use crate::dedup::sha256_file;
@@ -40,12 +42,13 @@ pub struct Skipped {
 }
 
 /// Execute a plan. Copy-only: there is no delete or move path anywhere.
-/// Files are copied with fs::copy, then verified by size. Every successful
-/// copy is appended to the persistent index immediately, so an interrupted
-/// run can never produce duplicates when re-run.
+/// Files are streamed to the destination while their SHA-256 is computed in
+/// the same read pass, then size-verified. Every successful copy is appended
+/// to the persistent index immediately, so an interrupted run can never
+/// produce duplicates when re-run.
 pub fn run(
     plan: &Plan,
-    _index: &Index, // kept for symmetry with the TUI call site
+    _index: &Index,
     dry_run: bool,
     cancel: &AtomicBool,
     tx: Sender<Progress>,
@@ -57,6 +60,7 @@ pub fn run(
         total_bytes,
         ..Default::default()
     };
+    let mut consecutive_errors = 0usize;
     let mut summary = Summary {
         copied: 0,
         copied_bytes: 0,
@@ -92,58 +96,77 @@ pub fn run(
         progress.current = f.original_name.clone();
         let _ = tx.send(progress.clone());
 
-        match copy_one(&f.source, dest, &f.hash) {
-            Ok(Imported::Copied) => {
-                summary.copied += 1;
-                summary.copied_bytes += f.size;
-                progress.copied_bytes += f.size;
-                progress.done_files += 1;
+        match copy_one(&f.source, dest, f.hash.as_deref()) {
+            Ok(outcome) => {
+                consecutive_errors = 0;
+                let hash = match &outcome {
+                    Outcome::Copied(hash) => hash.clone(),
+                    Outcome::AlreadyThere(hash) => hash.clone().unwrap_or_default(),
+                };
+                let dest_str = dest.to_string_lossy().into_owned();
+                match outcome {
+                    Outcome::Copied(_) => {
+                        summary.copied += 1;
+                        summary.copied_bytes += f.size;
+                        progress.copied_bytes += f.size;
+                        progress.done_files += 1;
+                    }
+                    Outcome::AlreadyThere(_) => {
+                        // Same content already at destination — not a new copy.
+                        progress.done_files += 1;
+                        summary.skipped.push(Skipped {
+                            original_name: f.original_name.clone(),
+                            size: f.size,
+                            known: Some(dest_str.clone()),
+                        });
+                    }
+                }
+                // Index the content either way so future runs dedup against it.
                 let entry = crate::config::IndexEntry {
-                    hash: f.hash.clone(),
+                    hash,
                     size: f.size,
                     media_type: format!("{:?}", f.media_type),
                     original_name: f.original_name.clone(),
-                    dest: dest.to_string_lossy().into_owned(),
+                    dest: dest_str,
                     imported_at: jiff::Timestamp::now().to_string(),
                 };
                 if let Err(e) = append_index(&entry) {
-                    summary
-                        .errors
-                        .push(format!("index write failed: {e:#}"));
+                    summary.errors.push(format!("index write failed: {e:#}"));
                 }
             }
-            Ok(Imported::AlreadyThere) => {
-                // Same content already at destination — not a new copy.
-                progress.done_files += 1;
-                summary.skipped.push(Skipped {
-                    original_name: f.original_name.clone(),
-                    size: f.size,
-                    known: Some(dest.to_string_lossy().into_owned()),
-                });
+            Err(e) => {
+                summary.errors.push(format!("{}: {e:#}", f.original_name));
+                consecutive_errors += 1;
+                // If the destination device has clearly vanished (unmount,
+                // cable pull, USB drop), stop hammering it and report once.
+                if consecutive_errors >= 25 {
+                    summary.errors.push(
+                        "ABORTED: the destination stopped responding after repeated \
+                         failures — is the SSD still connected? Files already copied \
+                         are kept and indexed; re-run when the drive is back."
+                            .to_string(),
+                    );
+                    break;
+                }
             }
-            Err(e) => summary.errors.push(format!(
-                "{}: {e:#}",
-                f.original_name
-            )),
         }
         let _ = tx.send(progress.clone());
     }
 
-    if !summary.cancelled {
-        // Keep any partial progress; index already persisted per file.
-    }
     progress.finished = true;
     progress.cancelled = summary.cancelled;
     let _ = tx.send(progress);
     Ok(summary)
 }
 
-enum Imported {
-    Copied,
-    AlreadyThere,
+enum Outcome {
+    /// New copy landed; hash computed during the copy.
+    Copied(String),
+    /// Identical content already at destination; hash if known.
+    AlreadyThere(Option<String>),
 }
 
-fn copy_one(source: &Path, dest: &PathBuf, expected_hash: &str) -> Result<Imported> {
+fn copy_one(source: &Path, dest: &PathBuf, expected_hash: Option<&str>) -> Result<Outcome> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -152,29 +175,48 @@ fn copy_one(source: &Path, dest: &PathBuf, expected_hash: &str) -> Result<Import
     // Airtight no-clobber guarantee: if anything now sits at the destination
     // path, it is either identical content (skip) or a hard error — never an
     // overwrite.
+    let source_size = fs::metadata(source)?.len();
     if let Ok(md) = fs::metadata(dest) {
-        if md.len() == sha_size(source)? && sha256_file(dest)? == expected_hash {
-            return Ok(Imported::AlreadyThere);
+        if let Some(expected) = expected_hash {
+            if md.len() == source_size && sha256_file(dest)? == expected {
+                return Ok(Outcome::AlreadyThere(Some(expected.to_string())));
+            }
         }
         anyhow::bail!(
-            "destination already exists with different content, refusing to touch it: {}",
+            "destination already exists, refusing to touch it: {}",
             dest.display()
         );
     }
 
-    let copied = fs::copy(source, dest)
-        .with_context(|| format!("copying to {}", dest.display()))?;
+    // Streamed copy with inline hashing: one read pass for both.
+    let source_file = fs::File::open(source)
+        .with_context(|| format!("reading {}", source.display()))?;
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, source_file);
+    let dest_file = fs::File::create(dest)
+        .with_context(|| format!("writing {}", dest.display()))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, dest_file);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer
+            .write_all(&buf[..n])
+            .with_context(|| format!("writing {}", dest.display()))?;
+        hasher.update(&buf[..n]);
+        written += n as u64;
+    }
+    writer.flush()?;
+    drop(writer);
 
     // Verify the copy landed complete.
     let md = fs::metadata(dest)
         .with_context(|| format!("verifying {}", dest.display()))?;
-    if md.len() != copied {
+    if md.len() != written || written != source_size {
         anyhow::bail!("size mismatch after copy: {}", dest.display());
     }
-    Ok(Imported::Copied)
-}
-
-/// Cheap size read used for verification.
-fn sha_size(path: &Path) -> Result<u64> {
-    Ok(fs::metadata(path)?.len())
+    Ok(Outcome::Copied(format!("{:x}", hasher.finalize())))
 }

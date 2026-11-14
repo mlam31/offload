@@ -39,7 +39,7 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<()> {
         return Ok(());
     }
     println!(
-        "Found {} media files ({:.1} GB). Hashing for dedup…",
+        "Found {} media files ({:.1} GB). Fingerprinting for dedup…",
         files.len(),
         gb(files.iter().map(|f| f.size).sum())
     );
@@ -49,7 +49,23 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<()> {
         rename: args.rename,
         force: args.force,
     };
-    let plan = build_plan(files, &index, &args.dest, opts)?;
+    let (hash_tx, hash_rx) = mpsc::channel();
+    let printer = std::thread::spawn(move || {
+        for (done, total) in hash_rx {
+            if total == 0 {
+                continue;
+            }
+            let width = 30;
+            let filled = (done as f64 / total as f64 * width as f64).round() as usize;
+            let bar = "█".repeat(filled) + &"░".repeat(width - filled);
+            eprint!("\r  [{bar}] {done}/{total} files hashed  ");
+        }
+    });
+    let plan = build_plan(files, &index, &args.dest, opts, Some(&hash_tx));
+    drop(hash_tx); // ends the printer thread
+    let _ = printer.join();
+    eprintln!();
+    let plan = plan?;
     let st = plan.stats();
 
     if st.copy_count > 0 {
