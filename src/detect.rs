@@ -20,16 +20,15 @@ impl SourceInfo {
 }
 
 /// Find mounted volumes that look like a camera card: contain media files
-/// somewhere below DCIM or PRIVATE (the Sony A6700 layout). Falls back to
-/// any volume that contains supported media files at all.
+/// somewhere below DCIM or PRIVATE (the Sony A6700 layout). Only camera cards
+/// are considered as sources — other drives are never picked automatically.
 pub fn detect_source() -> Result<Option<SourceInfo>> {
     let candidates = mounted_volumes();
 
-    // Cheap structural check first: Sony cards have DCIM/ and/or PRIVATE/.
+    // Camera cards have DCIM/ and/or PRIVATE/ at the root.
     let camera_cards: Vec<PathBuf> = candidates
-        .iter()
+        .into_iter()
         .filter(|v| v.join("DCIM").exists() || v.join("PRIVATE").exists())
-        .cloned()
         .collect();
 
     for vol in &camera_cards {
@@ -42,25 +41,7 @@ pub fn detect_source() -> Result<Option<SourceInfo>> {
         }
     }
 
-    // Fallback: any volume that contains supported media files at all.
-    let mut fallback: Option<(PathBuf, Vec<MediaFile>)> = None;
-    for vol in candidates {
-        if camera_cards.contains(&vol) {
-            continue;
-        }
-        let files = scan_source(&vol).unwrap_or_default();
-        if files.is_empty() {
-            continue;
-        }
-        if fallback
-            .as_ref()
-            .map(|(_, f)| f.len() < files.len())
-            .unwrap_or(true)
-        {
-            fallback = Some((vol, files));
-        }
-    }
-    Ok(fallback.map(|(root, files)| SourceInfo { root, files }))
+    Ok(None)
 }
 
 fn mounted_volumes() -> Vec<PathBuf> {

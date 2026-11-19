@@ -49,6 +49,9 @@ impl Node {
 fn load_children(path: &PathBuf) -> Vec<Node> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
+    // When browsing the system root on macOS, skip /Volumes — mounted volumes
+    // are already shown as top-level entries.
+    let skip_volumes = cfg!(target_os = "macos") && path == std::path::Path::new("/");
     if let Ok(entries) = fs::read_dir(path) {
         for e in entries.flatten() {
             let p = e.path();
@@ -56,6 +59,9 @@ fn load_children(path: &PathBuf) -> Vec<Node> {
             // Skip hidden entries (dotfiles, .Trashes, bundles).
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
+                continue;
+            }
+            if skip_volumes && name == "Volumes" {
                 continue;
             }
             if ft.is_dir() {
@@ -107,10 +113,23 @@ impl Tree {
                 roots.extend(vols);
             }
         }
-        // On macOS, the system disk is still browsable, just sorted last.
+        // On macOS, add the system root so destinations on the internal SSD are
+        // browsable (e.g. /Users/.../Pictures). /Volumes children are skipped
+        // inside it to avoid duplicates with the mounted volume entries above.
+        #[cfg(target_os = "macos")]
+        {
+            if !roots.iter().any(|n| n.path == std::path::Path::new("/")) {
+                let mut sys = Node::new(PathBuf::from("/"), true);
+                sys.name = "Macintosh HD".to_string();
+                roots.push(sys);
+            }
+        }
+        // On macOS, keep the system disk sorted last if present as a volume.
         if let Some(pos) = roots.iter().position(|n| n.name == "Macintosh HD") {
-            let sys = roots.remove(pos);
-            roots.push(sys);
+            if pos + 1 != roots.len() {
+                let sys = roots.remove(pos);
+                roots.push(sys);
+            }
         }
         Tree { roots, cursor: 0 }
     }

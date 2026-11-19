@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -10,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::dedup::sha256_file;
 use crate::plan::{Action, Plan, PlannedFile};
 
-/// Live progress sent from the copy thread to the UI.
+/// Live progress sent from the copy thread(s) to the UI.
 #[derive(Debug, Clone, Default)]
 pub struct Progress {
     pub total_files: usize,
@@ -52,6 +54,8 @@ const DEST_UNRESPONSIVE: &str = "ABORTED: the destination stopped responding aft
 /// the same read pass, then size-verified. Every successful copy is appended
 /// to the persistent index immediately, so an interrupted run can never
 /// produce duplicates when re-run.
+///
+/// Copies run on a small thread pool to overlap SD-card reads and SSD writes.
 pub fn run(
     plan: &Plan,
     index_path: &Path,
@@ -60,64 +64,140 @@ pub fn run(
     tx: Sender<Progress>,
 ) -> Result<Summary> {
     let copies: Vec<&PlannedFile> = plan.files.iter().filter(|f| f.is_copy()).collect();
-    let mut progress = Progress {
+    let progress = Progress {
         total_files: copies.len(),
         total_bytes: copies.iter().map(|f| f.size).sum(),
         ..Default::default()
     };
-    let mut summary = Summary {
+    let summary = Summary {
         skipped: collect_skips(plan),
         ..Default::default()
     };
 
     if dry_run {
-        progress.finished = true;
-        let _ = tx.send(progress);
+        let mut p = progress;
+        p.finished = true;
+        let _ = tx.send(p);
         return Ok(summary);
     }
 
-    run_copies(&copies, index_path, cancel, &tx, &mut progress, &mut summary);
-    progress.finished = true;
-    progress.cancelled = summary.cancelled;
-    let _ = tx.send(progress);
-    Ok(summary)
+    let index = crate::config::load_index_from(index_path)?;
+    run_copies_parallel(copies, index, index_path.to_path_buf(), cancel, &tx, progress, summary)
 }
 
-/// Copy every planned file, tracking progress and halting on cancel or when
-/// the destination clearly stops responding.
-fn run_copies(
-    copies: &[&PlannedFile],
-    index_path: &Path,
+struct SharedState {
+    index: crate::config::Index,
+    index_path: std::path::PathBuf,
+    progress: Progress,
+    summary: Summary,
+    consecutive_errors: usize,
+    aborted: bool,
+}
+
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 4)
+}
+
+/// Copy planned files using a small thread pool. File IO runs in parallel;
+/// index persistence and progress accounting are serialized through shared
+/// state so concurrent completions stay consistent.
+fn run_copies_parallel(
+    copies: Vec<&PlannedFile>,
+    index: crate::config::Index,
+    index_path: std::path::PathBuf,
     cancel: &AtomicBool,
     tx: &Sender<Progress>,
-    progress: &mut Progress,
-    summary: &mut Summary,
+    progress: Progress,
+    summary: Summary,
+) -> Result<Summary> {
+    if copies.is_empty() {
+        let mut p = progress;
+        p.finished = true;
+        let _ = tx.send(p);
+        return Ok(summary);
+    }
+
+    let state = Arc::new(Mutex::new(SharedState {
+        index,
+        index_path,
+        progress,
+        summary,
+        consecutive_errors: 0,
+        aborted: false,
+    }));
+    let queue = Arc::new(Mutex::new(VecDeque::from(copies)));
+    let workers = worker_count();
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let state = Arc::clone(&state);
+            s.spawn(move || worker_loop(&queue, &state, cancel, tx));
+        }
+    });
+
+    let mut st = Arc::try_unwrap(state)
+        .ok()
+        .expect("worker threads joined")
+        .into_inner()
+        .unwrap();
+    st.progress.finished = true;
+    st.progress.cancelled = st.summary.cancelled;
+    let _ = tx.send(st.progress);
+    Ok(st.summary)
+}
+
+fn worker_loop(
+    queue: &Arc<Mutex<VecDeque<&PlannedFile>>>,
+    state: &Arc<Mutex<SharedState>>,
+    cancel: &AtomicBool,
+    tx: &Sender<Progress>,
 ) {
-    let mut consecutive_errors = 0usize;
-    for f in copies {
+    loop {
         if cancel.load(Ordering::SeqCst) {
-            summary.cancelled = true;
+            let mut st = state.lock().unwrap();
+            st.summary.cancelled = true;
             break;
         }
-        let Action::Copy { dest } = &f.action else { unreachable!() };
-        progress.current = f.original_name.clone();
-        let _ = tx.send(progress.clone());
+        if state.lock().unwrap().aborted {
+            break;
+        }
 
+        let job = queue.lock().unwrap().pop_front();
+        let Some(f) = job else { break };
+
+        {
+            let mut st = state.lock().unwrap();
+            st.progress.current = f.original_name.clone();
+            let _ = tx.send(st.progress.clone());
+        }
+
+        let Action::Copy { dest } = &f.action else {
+            unreachable!()
+        };
         match copy_one(&f.source, dest, f.hash.as_deref()) {
             Ok(outcome) => {
-                consecutive_errors = 0;
-                record_outcome(outcome, f, dest, index_path, progress, summary);
+                let mut st = state.lock().unwrap();
+                st.consecutive_errors = 0;
+                record_outcome_state(outcome, f, dest, &mut st);
+                let _ = tx.send(st.progress.clone());
             }
             Err(e) => {
-                summary.errors.push(format!("{}: {e:#}", f.original_name));
-                consecutive_errors += 1;
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    summary.errors.push(DEST_UNRESPONSIVE.to_string());
-                    break;
+                let mut st = state.lock().unwrap();
+                st.summary
+                    .errors
+                    .push(format!("{}: {e:#}", f.original_name));
+                st.consecutive_errors += 1;
+                if st.consecutive_errors >= MAX_CONSECUTIVE_ERRORS && !st.aborted {
+                    st.summary.errors.push(DEST_UNRESPONSIVE.to_string());
+                    st.aborted = true;
                 }
+                let _ = tx.send(st.progress.clone());
             }
         }
-        let _ = tx.send(progress.clone());
     }
 }
 
@@ -136,16 +216,8 @@ fn collect_skips(plan: &Plan) -> Vec<Skipped> {
         .collect()
 }
 
-/// Account for one finished copy attempt and index its content either way,
-/// so future runs dedup against it.
-fn record_outcome(
-    outcome: Outcome,
-    f: &PlannedFile,
-    dest: &Path,
-    index_path: &Path,
-    progress: &mut Progress,
-    summary: &mut Summary,
-) {
+/// Account for one finished copy attempt and persist its content in the index.
+fn record_outcome_state(outcome: Outcome, f: &PlannedFile, dest: &Path, st: &mut SharedState) {
     let hash = match &outcome {
         Outcome::Copied(hash) => hash.clone(),
         Outcome::AlreadyThere(hash) => hash.clone().unwrap_or_default(),
@@ -153,15 +225,15 @@ fn record_outcome(
     let dest_str = dest.to_string_lossy().into_owned();
     match outcome {
         Outcome::Copied(_) => {
-            summary.copied += 1;
-            summary.copied_bytes += f.size;
-            progress.copied_bytes += f.size;
-            progress.done_files += 1;
+            st.summary.copied += 1;
+            st.summary.copied_bytes += f.size;
+            st.progress.copied_bytes += f.size;
+            st.progress.done_files += 1;
         }
         Outcome::AlreadyThere(_) => {
             // Same content already at destination — not a new copy.
-            progress.done_files += 1;
-            summary.skipped.push(Skipped {
+            st.progress.done_files += 1;
+            st.summary.skipped.push(Skipped {
                 original_name: f.original_name.clone(),
                 size: f.size,
                 known: Some(dest_str.clone()),
@@ -176,8 +248,9 @@ fn record_outcome(
         dest: dest_str,
         imported_at: jiff::Timestamp::now().to_string(),
     };
-    if let Err(e) = crate::config::append_index_to(index_path, &entry) {
-        summary.errors.push(format!("index write failed: {e:#}"));
+    st.index.entries.push(entry);
+    if let Err(e) = crate::config::save_index_to(&st.index_path, &st.index) {
+        st.summary.errors.push(format!("index write failed: {e:#}"));
     }
 }
 
@@ -412,8 +485,9 @@ mod tests {
     #[test]
     fn run_aborts_after_repeated_destination_failures() {
         let tmp = TempDir::new().unwrap();
-        // 30 planned copies whose sources do not exist → 30 straight errors;
-        // the loop must stop hammering after 25 and report once.
+        // 30 planned copies whose sources do not exist → 30 straight errors.
+        // The run must stop hammering once the destination clearly stops
+        // responding, even with parallel workers completing in flight.
         let files: Vec<PlannedFile> = (0..30)
             .map(|i| {
                 planned_copy(
@@ -428,7 +502,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let summary = run(&plan, &tmp.path().join("index.json"), false, &AtomicBool::new(false), tx).unwrap();
         assert!(summary.errors.iter().any(|e| e.contains("ABORTED")));
-        assert!(summary.errors.len() <= MAX_CONSECUTIVE_ERRORS + 1);
+        assert!(summary.errors.len() < 30);
         assert!(summary.copied == 0 && !summary.cancelled);
     }
 }
